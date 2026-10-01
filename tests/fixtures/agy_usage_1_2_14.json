@@ -1,0 +1,14 @@
+{
+  "conversation_id": "",
+  "status": "SUCCESS",
+  "response": "Gemini Models\tWeekly Limit Remaining\t71%\t2026-10-03T17:49:59Z\nGemini Models\tFive Hour Limit Remaining\t91%\t2026-10-01T13:28:46Z\nClaude and GPT models\tWeekly Limit Remaining\t100%\t2026-10-08T08:58:59Z\nClaude and GPT models\tFive Hour Limit Remaining\t100%\t2026-10-01T13:58:59Z\n",
+  "duration_seconds": 0,
+  "num_turns": 0,
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "thinking_tokens": 0,
+    "cache_read_tokens": 0,
+    "total_tokens": 0
+  }
+}

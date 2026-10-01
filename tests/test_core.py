@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -80,6 +81,91 @@ class RegistryTests(unittest.TestCase):
         data, projects = mx.load_manifest(None)
         self.assertEqual(data, {})
         self.assertEqual(len(projects), 8)
+
+    def test_concurrent_project_cli_updates_preserve_both_records(self):
+        repo1, plan1 = self._repo_and_plan("parallel1")
+        repo2, plan2 = self._repo_and_plan("parallel2")
+        home = Path(self.tmp.name) / "cli-home"
+        env = dict(__import__('os').environ, AGY_MULTIPLEX_HOME=str(home))
+        base = [sys.executable, str(ROOT / "multiplex.py"), "add-project"]
+        p1 = subprocess.Popen(base + ["--name", "p-one", "--repo", str(repo1), "--plan", str(plan1)],
+                              env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        p2 = subprocess.Popen(base + ["--name", "p-two", "--repo", str(repo2), "--plan", str(plan2)],
+                              env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out1, err1 = p1.communicate(timeout=10); out2, err2 = p2.communicate(timeout=10)
+        self.assertEqual(p1.returncode, 0, err1 or out1)
+        self.assertEqual(p2.returncode, 0, err2 or out2)
+        data = json.loads((home / "state" / "projects.json").read_text())
+        self.assertEqual(set(data["projects"]), {"p-one", "p-two"})
+
+    @unittest.skipIf(mx.fcntl is None, "fcntl account locks require macOS/Linux")
+    def test_account_operation_lock_is_cross_process(self):
+        home = Path(self.tmp.name) / "lock-home"
+        env = dict(__import__('os').environ, AGY_MULTIPLEX_HOME=str(home), PYTHONPATH=str(ROOT))
+        holder_code = (
+            "import time,multiplex as m; "
+            "ctx=m.account_operation_lock('A1'); ctx.__enter__(); "
+            "print('LOCKED', flush=True); time.sleep(2); ctx.__exit__(None,None,None)"
+        )
+        holder = subprocess.Popen([sys.executable, "-c", holder_code], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "LOCKED")
+            contender_code = (
+                "import multiplex as m; "
+                "\ntry:\n with m.account_operation_lock('A1', blocking=False): print('ACQUIRED')"
+                "\nexcept BlockingIOError: print('BLOCKED')"
+            )
+            contender = subprocess.run([sys.executable, "-c", contender_code], env=env,
+                                       capture_output=True, text=True, timeout=5)
+            self.assertEqual(contender.returncode, 0, contender.stderr)
+            self.assertEqual(contender.stdout.strip(), "BLOCKED")
+        finally:
+            holder.terminate(); holder.communicate(timeout=5)
+
+    def test_binding_invalidation_increments_generation_and_clears_identity(self):
+        mx.write_json(mx.account_db_path(), {"schema_version": 2, "accounts": {"A1": {
+            "enabled": True, "bound": True, "credential_generation": 4,
+            "identity_sha256": "hash", "masked_identity": "a***@x", "verified_at": "now",
+        }}})
+        generation = mx.invalidate_account_binding("A1")
+        item = mx.account_db()["accounts"]["A1"]
+        self.assertEqual(generation, 5)
+        self.assertEqual(item["credential_generation"], 5)
+        self.assertFalse(item["bound"])
+        self.assertNotIn("identity_sha256", item)
+        self.assertNotIn("masked_identity", item)
+        self.assertNotIn("verified_at", item)
+
+    def test_clone_and_remove_volume_use_bounded_timeouts(self):
+        with mock.patch.object(mx, "ensure_volume"), mock.patch.object(mx, "sh") as sh:
+            mx.clone_volume("image", "src", "dst")
+            self.assertEqual(sh.call_args.kwargs["timeout"], mx.DOCKER_OP_TIMEOUT)
+            self.assertIn("--name", sh.call_args.args)
+        with mock.patch.object(mx, "sh") as sh:
+            mx.remove_volume("dst")
+            self.assertEqual(sh.call_args.kwargs["timeout"], 20)
+
+    def test_clone_timeout_removes_named_helper_container(self):
+        timeout = subprocess.TimeoutExpired(cmd=["docker"], timeout=mx.DOCKER_OP_TIMEOUT)
+        cleanup = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(mx, "ensure_volume"), \
+             mock.patch.object(mx, "sh", side_effect=[timeout, cleanup]) as sh:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                mx.clone_volume("image", "src", "dst")
+        cleanup_call = sh.call_args_list[1]
+        self.assertEqual(cleanup_call.args[:3], ("docker", "rm", "-f"))
+        self.assertEqual(cleanup_call.kwargs["timeout"], 20)
+
+    def test_bind_fails_fast_when_account_operation_lock_is_busy(self):
+        ctx = mock.MagicMock()
+        ctx.__enter__.side_effect = BlockingIOError()
+        args = __import__('argparse').Namespace(account="A1", image="img")
+        with mock.patch.object(mx, "account_operation_lock", return_value=ctx), \
+             mock.patch.object(mx, "_cmd_bind_locked") as inner:
+            rc = mx.cmd_bind(args)
+        self.assertEqual(rc, 4)
+        inner.assert_not_called()
 
 
 if __name__ == "__main__":

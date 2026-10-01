@@ -29,6 +29,7 @@ dist/
 *.swp
 
 # Local reports and evidence
+reviews/
 coverage.xml
 .coverage
 htmlcov/

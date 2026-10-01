@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import argparse, hashlib, json, os, re, shutil, signal, subprocess, sys, time, uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - public alpha currently targets macOS/Linux
+    fcntl = None
 
 CODE_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.environ.get("AGY_MULTIPLEX_HOME", str(Path.home() / ".agy-multiplex-isolated"))).expanduser().resolve()
@@ -12,15 +18,18 @@ STATE = DATA_ROOT / "state"
 RUNS = DATA_ROOT / "runs"
 DEFAULT_IMAGE = os.environ.get("AGY_MULTIPLEX_IMAGE", "agy-multiplex-isolated:1.2.14")
 DEFAULT_SLOTS = max(1, int(os.environ.get("AGY_MULTIPLEX_SLOTS", "5")))
+DOCKER_OP_TIMEOUT = max(10, int(os.environ.get("AGY_DOCKER_OP_TIMEOUT", "60")))
 IDENTITY_RE = re.compile(r"authenticated successfully as (\S+)", re.I)
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 DENY_CMDS = ["git","gh","rm","mv","cp","sudo","su","security","curl","wget","ssh","scp","rsync","docker","podman","kubectl","helm","terraform","vercel","firebase","supabase","gcloud","aws","az"]
 
 
-def sh(*args: str, check: bool = True, input_text: str | None = None, capture: bool = True) -> subprocess.CompletedProcess[str]:
+def sh(*args: str, check: bool = True, input_text: str | None = None,
+       capture: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, check=check, text=True, input=input_text,
                           stdout=subprocess.PIPE if capture else None,
-                          stderr=subprocess.PIPE if capture else None)
+                          stderr=subprocess.PIPE if capture else None,
+                          timeout=timeout)
 
 
 def read_json(path: Path) -> Any:
@@ -29,9 +38,44 @@ def read_json(path: Path) -> Any:
 
 def write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@contextmanager
+def state_lock(name: str, *, blocking: bool = True):
+    lock_dir = STATE / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    handle = (lock_dir / f"{slug(name)}.lock").open("a+")
+    if fcntl is None:
+        try:
+            yield
+        finally:
+            handle.close()
+        return
+    flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+    acquired = False
+    try:
+        fcntl.flock(handle.fileno(), flags)
+        acquired = True
+        yield
+    finally:
+        try:
+            if acquired:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def account_operation_lock(account: str, *, blocking: bool = True):
+    account = validate_id(account, "account id")
+    digest = hashlib.sha256(account.casefold().encode()).hexdigest()[:16]
+    return state_lock(f"account-op-{digest}", blocking=blocking)
+
 
 def slug(text: str) -> str:
     out = re.sub(r"[^A-Za-z0-9_-]+", "-", text.strip()).strip("-").lower()
@@ -74,6 +118,7 @@ def account_db() -> dict[str, Any]:
         data.setdefault("accounts", {})
         for item in data["accounts"].values():
             item.setdefault("enabled", True)
+            item.setdefault("credential_generation", 0)
         return data
     return {"schema_version": 2, "accounts": {}}
 
@@ -143,20 +188,25 @@ def image_version(image: str) -> str | None:
     return p.stdout.strip() if p.returncode == 0 else None
 
 def ensure_volume(name: str) -> None:
-    if sh("docker", "volume", "inspect", name, check=False).returncode != 0:
-        sh("docker", "volume", "create", name)
+    if sh("docker", "volume", "inspect", name, check=False, timeout=20).returncode != 0:
+        sh("docker", "volume", "create", name, timeout=20)
 
 
 def clone_volume(image: str, source: str, target: str) -> None:
     ensure_volume(source); ensure_volume(target)
     cmd = "set -e; uid=$(id -u agy); gid=$(id -g agy); rm -rf /dst/* /dst/.[!.]* /dst/..?* 2>/dev/null || true; cp -a /src/. /dst/; chown -R ${uid}:${gid} /dst"
-    sh("docker", "run", "--rm", "--user", "0:0",
-       "-v", f"{source}:/src:ro", "-v", f"{target}:/dst", image,
-       "bash", "-lc", cmd)
+    cname = f"agy-copy-{uuid.uuid4().hex[:12]}"
+    try:
+        sh("docker", "run", "--rm", "--name", cname, "--user", "0:0",
+           "-v", f"{source}:/src:ro", "-v", f"{target}:/dst", image,
+           "bash", "-lc", cmd, timeout=DOCKER_OP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        sh("docker", "rm", "-f", cname, check=False, timeout=20)
+        raise
 
 
 def remove_volume(name: str) -> None:
-    sh("docker", "volume", "rm", "-f", name, check=False)
+    sh("docker", "volume", "rm", "-f", name, check=False, timeout=20)
 
 
 def project_profile(project_id: str) -> dict[str, Any]:
@@ -174,8 +224,14 @@ def project_profile(project_id: str) -> dict[str, Any]:
 
 def install_profile(image: str, volume: str, profile_file: Path, project_id: str) -> None:
     cmd = f"uid=$(id -u agy); gid=$(id -g agy); mkdir -p /home/agy/.gemini/config/projects; cp /tmp/profile.json /home/agy/.gemini/config/projects/{project_id}.json; chown -R ${{uid}}:${{gid}} /home/agy/.gemini"
-    sh("docker", "run", "--rm", "--user", "0:0", "-v", f"{volume}:/home/agy",
-       "-v", f"{profile_file}:/tmp/profile.json:ro", image, "bash", "-lc", cmd)
+    cname = f"agy-profile-{uuid.uuid4().hex[:12]}"
+    try:
+        sh("docker", "run", "--rm", "--name", cname, "--user", "0:0", "-v", f"{volume}:/home/agy",
+           "-v", f"{profile_file}:/tmp/profile.json:ro", image, "bash", "-lc", cmd,
+           timeout=DOCKER_OP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        sh("docker", "rm", "-f", cname, check=False, timeout=20)
+        raise
 
 
 def git(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -384,7 +440,8 @@ def launch_job(project: Project, task: dict[str, Any], account: str, slot: int,
     lane_dir.mkdir(parents=True, exist_ok=False)
     worktree, base = create_lane_worktree(project, tid, lane_dir)
     volume = lane_volume(run_id, account, project.name, tid, slot)
-    clone_volume(image, master_volume(account), volume)
+    with account_operation_lock(account):
+        clone_volume(image, master_volume(account), volume)
     project_id = f"agyiso-{slug(project.name)}-{slug(tid)}-{uuid.uuid4().hex[:6]}"
     profile_file = lane_dir / "project.json"
     write_json(profile_file, project_profile(project_id))
@@ -394,10 +451,14 @@ def launch_job(project: Project, task: dict[str, Any], account: str, slot: int,
     stdout_file = (lane_dir / "stdout.log").open("w", encoding="utf-8")
     cname = f"agyiso-{slug(run_id)}-{slug(account)}-{slug(tid)}-{slot}"
     cmd = ["docker", "run", "--rm", "--name", cname, "-i",
+           "--cap-drop=ALL", "--security-opt=no-new-privileges",
            "--label", f"agy.multiplex.run={run_id}",
            "--label", f"agy.multiplex.account={account}",
+           "--label", f"agy.multiplex.project={project.name}",
+           "--label", "agy.multiplex.kind=lane",
            "-v", f"{volume}:/home/agy",
            "-v", f"{worktree}:/workspace",
+           "-v", f"{worktree / '.git'}:/workspace/.git:ro",
            "-v", f"{evidence}:/evidence",
            "-w", "/workspace", image, "agy",
            "--project", project_id, "--mode=accept-edits", "--sandbox",
@@ -493,16 +554,20 @@ def ensure_unique_account_id(db: dict[str, Any], account: str) -> str:
 
 
 def add_account(account: str) -> dict[str, Any]:
-    db = account_db()
-    account = ensure_unique_account_id(db, account)
-    ensure_volume(master_volume(account))
-    item = db["accounts"].setdefault(account, {})
-    item.setdefault("bound", False)
-    item["enabled"] = True
-    item["volume"] = master_volume(account)
-    item.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    write_json(account_db_path(), db)
-    return item
+    account = validate_id(account, "account id")
+    with account_operation_lock(account):
+        with state_lock("accounts-registry"):
+            db = account_db()
+            account = ensure_unique_account_id(db, account)
+            ensure_volume(master_volume(account))
+            item = db["accounts"].setdefault(account, {})
+            item.setdefault("bound", False)
+            item.setdefault("credential_generation", 0)
+            item["enabled"] = True
+            item["volume"] = master_volume(account)
+            item.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+            write_json(account_db_path(), db)
+            return dict(item)
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -511,9 +576,13 @@ def cmd_init(args: argparse.Namespace) -> int:
     for account in args.accounts:
         add_account(account); added.append(account)
     if not account_db_path().exists():
-        write_json(account_db_path(), account_db())
+        with state_lock("accounts-registry"):
+            if not account_db_path().exists():
+                write_json(account_db_path(), account_db())
     if not project_db_path().exists():
-        write_json(project_db_path(), project_db())
+        with state_lock("projects-registry"):
+            if not project_db_path().exists():
+                write_json(project_db_path(), project_db())
     print(json.dumps({"status": "initialized", "data_root": str(DATA_ROOT),
                       "accounts_added": added, "configured_accounts": configured_account_ids(enabled_only=False)},
                      indent=2, ensure_ascii=False))
@@ -528,11 +597,26 @@ def cmd_account_add(args: argparse.Namespace) -> int:
 
 
 def set_account_enabled(account: str, enabled: bool) -> None:
-    db = account_db(); account = validate_id(account, "account id")
-    if account not in (db.get("accounts") or {}):
-        raise ValueError(f"unknown account: {account}")
-    db["accounts"][account]["enabled"] = enabled
-    write_json(account_db_path(), db)
+    account = validate_id(account, "account id")
+    with state_lock("accounts-registry"):
+        db = account_db()
+        if account not in (db.get("accounts") or {}):
+            raise ValueError(f"unknown account: {account}")
+        db["accounts"][account]["enabled"] = enabled
+        write_json(account_db_path(), db)
+
+
+def toggle_account_enabled(account: str) -> bool:
+    account = validate_id(account, "account id")
+    with state_lock("accounts-registry"):
+        db = account_db()
+        if account not in (db.get("accounts") or {}):
+            raise ValueError(f"unknown account: {account}")
+        enabled = db["accounts"][account].get("enabled", True) is not False
+        new_value = not enabled
+        db["accounts"][account]["enabled"] = new_value
+        write_json(account_db_path(), db)
+        return new_value
 
 
 def cmd_account_enable(args: argparse.Namespace) -> int:
@@ -546,11 +630,14 @@ def cmd_account_disable(args: argparse.Namespace) -> int:
 
 
 def cmd_account_remove(args: argparse.Namespace) -> int:
-    db = account_db(); account = validate_id(args.account, "account id")
-    item = (db.get("accounts") or {}).pop(account, None)
-    if item is None:
-        raise ValueError(f"unknown account: {account}")
-    write_json(account_db_path(), db)
+    account = validate_id(args.account, "account id")
+    with account_operation_lock(account):
+        with state_lock("accounts-registry"):
+            db = account_db()
+            item = (db.get("accounts") or {}).pop(account, None)
+            if item is None:
+                raise ValueError(f"unknown account: {account}")
+            write_json(account_db_path(), db)
     print(json.dumps({"status": "account_removed", "account": account,
                       "credentials_deleted": False,
                       "preserved_volume": item.get("volume") or master_volume(account)}, indent=2))
@@ -579,19 +666,53 @@ def require_registered_account(account: str) -> dict[str, Any]:
     return item
 
 
+def invalidate_account_binding(account: str) -> int:
+    account = validate_id(account, "account id")
+    with state_lock("accounts-registry"):
+        db = account_db()
+        item = (db.get("accounts") or {}).get(account)
+        if item is None:
+            raise ValueError(f"unknown account: {account}")
+        generation = int(item.get("credential_generation") or 0) + 1
+        item["credential_generation"] = generation
+        item["bound"] = False
+        for key in ("identity_sha256", "masked_identity", "verified_at", "binding_id"):
+            item.pop(key, None)
+        write_json(account_db_path(), db)
+        return generation
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     require_registered_account(args.account)
     ensure_volume(master_volume(args.account))
     workspace = DATA_ROOT / "login-workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-    cmd = ["docker", "run", "--rm", "-it",
+    cname = f"agy-login-{slug(args.account)}-{uuid.uuid4().hex[:8]}"
+    cmd = ["docker", "run", "--rm", "-it", "--name", cname,
+           "--label", f"agy.multiplex.account={args.account}",
+           "--label", "agy.multiplex.kind=login",
            "-v", f"{master_volume(args.account)}:/home/agy",
            "-v", f"{workspace}:/workspace", "-w", "/workspace", args.image, "agy"]
     print(f"Opening isolated login for {args.account}. Exit agy after authentication.")
-    return subprocess.call(cmd)
+    with account_operation_lock(args.account):
+        invalidate_account_binding(args.account)
+        try:
+            return subprocess.call(cmd)
+        finally:
+            sh("docker", "rm", "-f", cname, check=False, timeout=20)
 
 
 def cmd_bind(args: argparse.Namespace) -> int:
+    try:
+        with account_operation_lock(args.account, blocking=False):
+            return _cmd_bind_locked(args)
+    except BlockingIOError:
+        print(json.dumps({"status": "blocked", "account": args.account,
+                          "reason": "account operation already in progress"}, indent=2))
+        return 4
+
+
+def _cmd_bind_locked(args: argparse.Namespace) -> int:
     require_registered_account(args.account)
     ensure_volume(master_volume(args.account))
     probe = STATE / "probes" / args.account
@@ -602,14 +723,23 @@ def cmd_bind(args: argparse.Namespace) -> int:
     log = probe / "identity.log"; out = probe / "stdout.json"
     log.unlink(missing_ok=True); out.unlink(missing_ok=True)
     workspace = probe / "workspace"; workspace.mkdir(exist_ok=True)
-    cmd = ["docker", "run", "--rm", "-i",
+    cname = f"agy-verify-{slug(args.account)}-{uuid.uuid4().hex[:8]}"
+    cmd = ["docker", "run", "--rm", "--name", cname, "-i",
+           "--label", f"agy.multiplex.account={args.account}",
+           "--label", "agy.multiplex.kind=verify",
            "-v", f"{master_volume(args.account)}:/home/agy",
            "-v", f"{workspace}:/workspace", "-v", f"{probe}:/evidence",
            "-w", "/workspace", args.image, "agy", "--project", profile_id,
            "--mode=plan", "--sandbox", "--output-format", "json",
            "--print-timeout", "60s", "--log-file", "/evidence/identity.log"]
-    p = subprocess.run(cmd, input="Reply exactly: OK", text=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+    try:
+        p = subprocess.run(cmd, input="Reply exactly: OK", text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+    except subprocess.TimeoutExpired:
+        sh("docker", "rm", "-f", cname, check=False, timeout=20)
+        print(json.dumps({"status": "blocked", "account": args.account,
+                          "reason": "identity probe timed out"}, indent=2))
+        return 2
     out.write_text(p.stdout or "", encoding="utf-8")
     ids = log_identities(log)
     if p.returncode != 0 or not ids:
@@ -620,31 +750,43 @@ def cmd_bind(args: argparse.Namespace) -> int:
     identity = ids[-1]
     if any(x != identity for x in ids):
         print(json.dumps({"status": "failed", "reason": "multiple identities observed"}, indent=2)); return 3
-    db = account_db(); item = db["accounts"].setdefault(args.account, {})
-    item.update({"bound": True, "enabled": True, "volume": master_volume(args.account),
-                 "identity_sha256": email_hash(identity), "masked_identity": mask_email(identity),
-                 "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
-    write_json(account_db_path(), db)
+    with state_lock("accounts-registry"):
+        db = account_db(); item = db["accounts"].setdefault(args.account, {})
+        item.setdefault("enabled", True)
+        generation = int(item.get("credential_generation") or 0) + 1
+        item.update({"bound": True, "volume": master_volume(args.account),
+                     "identity_sha256": email_hash(identity), "masked_identity": mask_email(identity),
+                     "credential_generation": generation, "binding_id": uuid.uuid4().hex,
+                     "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        write_json(account_db_path(), db)
     print(json.dumps({"status": "bound", "account": args.account,
                       "identity": mask_email(identity)}, indent=2))
     return 0
 
 
-def cmd_project_add(args: argparse.Namespace) -> int:
-    name = validate_id(args.name, "project id")
-    repo = Path(args.repo).expanduser().resolve(); plan = Path(args.plan).expanduser().resolve()
-    record = {"name": name, "repo": str(repo), "plan": str(plan), "goal": args.goal or "",
-              "model": args.model or None, "enabled": True,
+def add_project(name: str, repo: str | Path, plan: str | Path, *, goal: str = "",
+                model: str | None = None) -> Project:
+    name = validate_id(name, "project id")
+    repo_path = Path(repo).expanduser().resolve(); plan_path = Path(plan).expanduser().resolve()
+    record = {"name": name, "repo": str(repo_path), "plan": str(plan_path), "goal": goal or "",
+              "model": model or None, "enabled": True,
               "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     project = project_from_record(record); validate_dag(project)
-    db = project_db()
-    for existing in (db.get("projects") or {}):
-        if existing.casefold() == name.casefold() and existing != name:
-            raise ValueError(f"project id conflicts case-insensitively with {existing!r}")
-    db["projects"][name] = {k: v for k, v in record.items() if k != "name"}
-    write_json(project_db_path(), db)
-    print(json.dumps({"status": "project_added", "project": name,
-                      "tasks": len(project.tasks), "repo": str(repo)}, indent=2)); return 0
+    record["task_count"] = len(project.tasks)
+    with state_lock("projects-registry"):
+        db = project_db()
+        for existing in (db.get("projects") or {}):
+            if existing.casefold() == name.casefold() and existing != name:
+                raise ValueError(f"project id conflicts case-insensitively with {existing!r}")
+        db["projects"][name] = {k: v for k, v in record.items() if k != "name"}
+        write_json(project_db_path(), db)
+    return project
+
+
+def cmd_project_add(args: argparse.Namespace) -> int:
+    project = add_project(args.name, args.repo, args.plan, goal=args.goal or "", model=args.model)
+    print(json.dumps({"status": "project_added", "project": project.name,
+                      "tasks": len(project.tasks), "repo": str(project.repo)}, indent=2)); return 0
 
 
 def cmd_projects(_: argparse.Namespace) -> int:
@@ -656,9 +798,24 @@ def cmd_projects(_: argparse.Namespace) -> int:
 
 
 def set_project_enabled(name: str, enabled: bool) -> None:
-    name = validate_id(name, "project id"); db = project_db()
-    if name not in (db.get("projects") or {}): raise ValueError(f"unknown project: {name}")
-    db["projects"][name]["enabled"] = enabled; write_json(project_db_path(), db)
+    name = validate_id(name, "project id")
+    with state_lock("projects-registry"):
+        db = project_db()
+        if name not in (db.get("projects") or {}): raise ValueError(f"unknown project: {name}")
+        db["projects"][name]["enabled"] = enabled
+        write_json(project_db_path(), db)
+
+
+def toggle_project_enabled(name: str) -> bool:
+    name = validate_id(name, "project id")
+    with state_lock("projects-registry"):
+        db = project_db()
+        if name not in (db.get("projects") or {}): raise ValueError(f"unknown project: {name}")
+        enabled = db["projects"][name].get("enabled", True) is not False
+        new_value = not enabled
+        db["projects"][name]["enabled"] = new_value
+        write_json(project_db_path(), db)
+        return new_value
 
 
 def cmd_project_enable(args: argparse.Namespace) -> int:
@@ -672,10 +829,12 @@ def cmd_project_disable(args: argparse.Namespace) -> int:
 
 
 def cmd_project_remove(args: argparse.Namespace) -> int:
-    name = validate_id(args.name, "project id"); db = project_db()
-    item = (db.get("projects") or {}).pop(name, None)
-    if item is None: raise ValueError(f"unknown project: {name}")
-    write_json(project_db_path(), db)
+    name = validate_id(args.name, "project id")
+    with state_lock("projects-registry"):
+        db = project_db()
+        item = (db.get("projects") or {}).pop(name, None)
+        if item is None: raise ValueError(f"unknown project: {name}")
+        write_json(project_db_path(), db)
     print(json.dumps({"status": "project_removed", "project": name,
                       "repository_deleted": False}, indent=2)); return 0
 

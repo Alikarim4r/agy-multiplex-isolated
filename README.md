@@ -20,6 +20,14 @@ selected accounts × per_account_slots
 
 `max_workers` can cap that capacity globally.
 
+## 5-hour and weekly usage
+
+The local bilingual login UI can show **used percentage** for the rolling 5-hour and weekly quota windows. Antigravity exposes separate quota groups, commonly **Gemini Models** and **Claude / GPT models**, so both groups are shown when available.
+
+Quota data is read through the signed-in account's official CLI command `agy -p /usage --output-format json`. On the pinned `agy 1.2.14`, the command returns an exact JSON envelope whose `response` field contains tab-separated rows with the model group, quota window, **remaining percentage**, and reset time. The UI converts that percentage to `used = 100 - remaining`. Automatic quota polling is off by default; the user can refresh manually. Refresh is deferred while the same account is logging in or running a lane, cached quota is tied to the verified credential generation, and raw credentials are never returned to the browser.
+
+The `agy 1.2.14` `/usage` contract was observed on an authenticated local session and the command reported `num_turns = 0` with all token counters at zero. A redacted regression fixture preserves that response shape. This validates quota parsing and display, but it does **not** certify concurrent OAuth refresh behavior for multiplex execution; that remains covered by the separate [LAB_GATE](LAB_GATE.md). If quota retrieval cannot be verified, the UI shows unavailable rather than inventing a percentage.
+
 ## Safety model
 
 - One independently authenticated Docker master volume per account.
