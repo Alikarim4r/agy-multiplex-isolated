@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AGY Account Login</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--card:#121a30;--muted:#8f9bb3;--text:#f4f7ff;--ok:#2dd4bf;--warn:#f59e0b;--bad:#fb7185;--accent:#7c3aed}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Tahoma,sans-serif;background:radial-gradient(circle at top,#17203a 0,#0b1020 48%);color:var(--text);min-height:100vh}
+.wrap{max-width:1100px;margin:auto;padding:44px 24px 72px}.hero{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:24px;flex-wrap:wrap}
+h1{margin:0;font-size:34px}.sub{color:var(--muted);margin-top:10px;line-height:1.7}.right{display:flex;gap:10px;align-items:center}.pill,.lang{border:1px solid #33405d;border-radius:999px;padding:8px 12px;color:#bac5dc;font-size:13px;background:#11192c}.lang{display:flex;padding:3px}
+.lang button{padding:6px 10px;border-radius:999px;background:transparent;color:#bac5dc}.lang button.active{background:#33405d;color:#fff}
+.add{display:flex;gap:10px;margin:0 0 22px;background:#10182a;border:1px solid #25324e;padding:12px;border-radius:16px}.add input{flex:1;background:#0b1222;border:1px solid #33405d;color:#fff;border-radius:11px;padding:11px 13px;outline:none}.add button{max-width:180px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(275px,1fr));gap:16px}.card{background:linear-gradient(180deg,#151f38,#11192c);border:1px solid #26324e;border-radius:20px;padding:20px;box-shadow:0 16px 40px #0004}.card.off{opacity:.65}
+.top{display:flex;align-items:center;justify-content:space-between}.name{font-size:22px;font-weight:800}.badge{font-size:12px;border-radius:999px;padding:6px 10px;background:#202a43;color:#c6d0e5}.identity{min-height:24px;margin:18px 0 6px;font-weight:650}.meta{font-size:12px;color:var(--muted);min-height:20px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:18px}
+button{border:0;border-radius:12px;padding:11px 12px;font-weight:750;cursor:pointer;background:#7c3aed;color:white}button.secondary{background:#26324e;color:#e7ecf7}button.ghost{background:#1b2338;color:#aeb9ce}button:disabled{opacity:.45;cursor:not-allowed}.note{margin-top:28px;border:1px solid #25324e;border-radius:16px;padding:15px 17px;color:#aeb9ce;background:#10182a;font-size:13px;line-height:1.7}.toast{position:fixed;left:24px;bottom:24px;background:#18223a;border:1px solid #33405d;padding:12px 16px;border-radius:12px;display:none;max-width:420px;z-index:5}.empty{grid-column:1/-1;text-align:center;color:var(--muted);padding:45px;border:1px dashed #33405d;border-radius:18px}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <div><h1 id="title"></h1><div id="subtitle" class="sub"></div></div>
+    <div class="right"><div class="pill">Local only · 127.0.0.1</div><div class="lang"><button id="arBtn" onclick="setLang('ar')">العربية</button><button id="enBtn" onclick="setLang('en')">English</button></div></div>
+  </div>
+  <div class="add"><input id="accountInput" autocomplete="off"><button id="addBtn" onclick="addAccount()"></button></div>
+  <div id="grid" class="grid"></div>
+  <div id="note" class="note"></div>
+</div>
+<div id="toast" class="toast"></div>
+<script>
+const TOKEN=new URLSearchParams(location.search).get('token')||'';
+const grid=document.getElementById('grid'),toast=document.getElementById('toast');
+let lang=localStorage.getItem('agy-ui-lang')||'ar';
+const T={
+ ar:{title:'تسجيل حسابات Antigravity',subtitle:'أضف أي عدد من الحسابات واربط كل حساب داخل حدود Docker معزولة.',verified:'موثّق',verifying:'جارٍ التحقق',open:'جلسة مفتوحة',failed:'فشل التحقق',notRegistered:'غير مسجل',disabled:'معطّل',noIdentity:'لم يتم ربط هوية بعد',finishLogin:'أكمل تسجيل الدخول في Terminal ثم اخرج من agy',ready:'جاهز',login:'تسجيل الدخول',verify:'تحقق من الحساب',enable:'تفعيل',disable:'تعطيل',add:'+ إضافة حساب',placeholder:'معرّف الحساب مثل work-1',empty:'لا توجد حسابات بعد. أضف أول حساب من الأعلى.',offline:'تعذر الاتصال بالواجهة المحلية',done:'تم',actionFailed:'فشل تنفيذ الأمر',account_added:'تمت إضافة الحساب',account_enabled:'تم تفعيل الحساب',account_disabled:'تم تعطيل الحساب',login_opened:'تم فتح جلسة التسجيل',verification_started:'بدأ التحقق',verifiedMsg:'تم التحقق وربط الحساب',verify_timeout:'انتهت مهلة التحقق',verify_failed:'فشل التحقق',close_login_first:'أغلق جلسة التسجيل أولًا ثم اضغط تحقق',login_already_open:'هناك جلسة لهذا الحساب مفتوحة بالفعل',note:'لا يتم عرض أو نسخ أي token هنا. أضف عددًا غير محدود برمجيًا من الحسابات. زر <b>تسجيل الدخول</b> يفتح جلسة للحساب المحدد فقط، وبعد Google OAuth اضغط <b>تحقق من الحساب</b>. البريد يظهر بشكل مقنّع فقط.'},
+ en:{title:'Antigravity Account Login',subtitle:'Add any number of accounts and bind each one inside an isolated Docker boundary.',verified:'Verified',verifying:'Verifying',open:'Login session open',failed:'Verification failed',notRegistered:'Not signed in',disabled:'Disabled',noIdentity:'No identity has been bound yet',finishLogin:'Complete sign-in in Terminal, then exit agy',ready:'Ready',login:'Sign in',verify:'Verify account',enable:'Enable',disable:'Disable',add:'+ Add account',placeholder:'Account ID, e.g. work-1',empty:'No accounts yet. Add your first account above.',offline:'Unable to reach the local interface',done:'Done',actionFailed:'Command failed',account_added:'Account added',account_enabled:'Account enabled',account_disabled:'Account disabled',login_opened:'Login session opened',verification_started:'Verification started',verifiedMsg:'Account verified and bound',verify_timeout:'Verification timed out',verify_failed:'Verification failed',close_login_first:'Close the login session first, then verify',login_already_open:'A login session for this account is already open',note:'No token is displayed or copied here. Add any number of accounts in software. <b>Sign in</b> opens a session only for the selected account; after Google OAuth, click <b>Verify account</b>. Only a masked email is shown.'}
+};
+function tr(k){return T[lang][k]||k}function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function message(v){return T[lang][v]||v||tr('ready')}
+function showToast(msg){toast.textContent=message(msg);toast.style.display='block';setTimeout(()=>toast.style.display='none',3500)}
+function setLang(next){lang=next;localStorage.setItem('agy-ui-lang',lang);document.documentElement.lang=lang;document.documentElement.dir=lang==='ar'?'rtl':'ltr';document.getElementById('title').textContent=tr('title');document.getElementById('subtitle').textContent=tr('subtitle');document.getElementById('note').innerHTML=tr('note');document.getElementById('addBtn').textContent=tr('add');document.getElementById('accountInput').placeholder=tr('placeholder');document.getElementById('arBtn').classList.toggle('active',lang==='ar');document.getElementById('enBtn').classList.toggle('active',lang==='en');refresh()}
+function badge(a){if(!a.enabled)return `<span class="badge bad">${tr('disabled')}</span>`;if(a.bound)return `<span class="badge ok">${tr('verified')}</span>`;if(a.action==='verifying')return `<span class="badge warn">${tr('verifying')}</span>`;if(a.busy)return `<span class="badge warn">${tr('open')}</span>`;if(a.action==='verify_failed')return `<span class="badge bad">${tr('failed')}</span>`;return `<span class="badge">${tr('notRegistered')}</span>`}
+function render(accounts){if(!accounts.length){grid.innerHTML=`<div class="empty">${tr('empty')}</div>`;return}grid.innerHTML=accounts.map(a=>{const id=a.identity?`<span class="ok">${esc(a.identity)}</span>`:tr('noIdentity');const msg=message(a.message)||(a.busy?tr('finishLogin'):tr('ready'));const disabled=!a.enabled||a.busy||a.action==='verifying';return `<section class="card ${a.enabled?'':'off'}"><div class="top"><div class="name">${esc(a.account)}</div>${badge(a)}</div><div class="identity">${id}</div><div class="meta">${esc(msg)}</div><div class="actions"><button ${disabled?'disabled':''} onclick="act('login','${esc(a.account)}')">${tr('login')}</button><button class="secondary" ${disabled?'disabled':''} onclick="act('verify','${esc(a.account)}')">${tr('verify')}</button><button class="ghost" ${a.busy?'disabled':''} onclick="act('toggle','${esc(a.account)}')">${a.enabled?tr('disable'):tr('enable')}</button></div></section>`}).join('')}
+async function refresh(){try{const r=await fetch(`/api/status?token=${encodeURIComponent(TOKEN)}`,{cache:'no-store'});const d=await r.json();render(d.accounts||[])}catch(e){showToast('offline')}}
+async function addAccount(){const input=document.getElementById('accountInput');const account=input.value.trim();if(!account)return;try{const r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json','X-UI-Token':TOKEN},body:JSON.stringify({account})});const d=await r.json();showToast(d.message||'done');if(r.ok)input.value='';refresh()}catch(e){showToast('actionFailed')}}
+async function act(action,account){try{const r=await fetch(`/api/${action}/${encodeURIComponent(account)}`,{method:'POST',headers:{'X-UI-Token':TOKEN}});const d=await r.json();showToast(d.message||'done');refresh()}catch(e){showToast('actionFailed')}}
+setLang(lang);setInterval(refresh,2500);
+</script>
+</body>
+</html>

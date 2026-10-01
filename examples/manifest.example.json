@@ -1,0 +1,8 @@
+{
+  "image": "agy-multiplex-isolated:1.2.14",
+  "agy_version": "1.2.14",
+  "accounts": "all",
+  "projects": "all",
+  "per_account_slots": 3,
+  "max_workers": 12
+}

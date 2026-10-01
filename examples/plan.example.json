@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "parallelizable": true,
+  "reason": "Independent write scopes",
+  "tasks": [
+    {
+      "task_id": "backend",
+      "goal": "Implement backend scope",
+      "dependencies": [],
+      "write_scope": ["src/backend/**"],
+      "acceptance": ["Backend scope is complete"]
+    },
+    {
+      "task_id": "frontend",
+      "goal": "Implement frontend scope",
+      "dependencies": [],
+      "write_scope": ["src/frontend/**"],
+      "acceptance": ["Frontend scope is complete"]
+    }
+  ]
+}

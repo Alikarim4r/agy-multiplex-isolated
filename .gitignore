@@ -1,0 +1,35 @@
+# Runtime data and credentials
+state/
+runs/
+login-workspace/
+*.command
+*.log
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local reports and evidence
+coverage.xml
+.coverage
+htmlcov/
+evidence/
