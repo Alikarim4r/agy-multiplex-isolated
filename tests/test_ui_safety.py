@@ -142,7 +142,7 @@ class QuotaIsolationTests(unittest.TestCase):
         self.assertNotIn("timeout", run.call_args.kwargs)
 
     def test_toggle_fails_closed_when_account_is_in_use(self):
-        with mock.patch.object(login_ui.core, "require_registered_account", return_value={"enabled": True}), \
+        with mock.patch.object(login_ui.core, "account_db", return_value={"accounts": {"A1": {"enabled": True}}}), \
              mock.patch.object(login_ui, "account_in_use", return_value=True), \
              mock.patch.object(login_ui.core, "toggle_account_enabled") as setter:
             ok, message = login_ui.toggle_account("A1")
