@@ -32,6 +32,20 @@ def sh(*args: str, check: bool = True, input_text: str | None = None,
                           timeout=timeout)
 
 
+def wait_for_container_running(name: str, proc: subprocess.Popen, timeout: float = 15.0) -> None:
+    """Keep the account startup lock until Docker reports the lane container running."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"lane container exited during startup: {name} (rc={proc.returncode})")
+        status = sh("docker", "inspect", "-f", "{{.State.Running}}", name,
+                    check=False, timeout=5)
+        if status.returncode == 0 and (status.stdout or "").strip().lower() == "true":
+            return
+        time.sleep(0.1)
+    raise TimeoutError(f"lane container did not reach running state: {name}")
+
+
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -440,12 +454,9 @@ def launch_job(project: Project, task: dict[str, Any], account: str, slot: int,
     lane_dir.mkdir(parents=True, exist_ok=False)
     worktree, base = create_lane_worktree(project, tid, lane_dir)
     volume = lane_volume(run_id, account, project.name, tid, slot)
-    with account_operation_lock(account):
-        clone_volume(image, master_volume(account), volume)
     project_id = f"agyiso-{slug(project.name)}-{slug(tid)}-{uuid.uuid4().hex[:6]}"
     profile_file = lane_dir / "project.json"
     write_json(profile_file, project_profile(project_id))
-    install_profile(image, volume, profile_file, project_id)
     evidence = lane_dir / "evidence"; evidence.mkdir(exist_ok=True)
     log_file = evidence / "agy.log"
     stdout_file = (lane_dir / "stdout.log").open("w", encoding="utf-8")
@@ -466,10 +477,24 @@ def launch_job(project: Project, task: dict[str, Any], account: str, slot: int,
            "--log-file", "/evidence/agy.log"]
     if project.model:
         cmd += ["--model", project.model]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=stdout_file,
-                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
-    assert proc.stdin is not None
-    proc.stdin.write(task_prompt(project, task)); proc.stdin.close()
+    proc = None
+    try:
+        # The lock spans clone + container startup. Once Docker reports Running,
+        # docker_snapshot can see the lane label and future quota/login operations
+        # fail closed as busy instead of racing the provider on the same account.
+        with account_operation_lock(account):
+            clone_volume(image, master_volume(account), volume)
+            install_profile(image, volume, profile_file, project_id)
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=stdout_file,
+                                    stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            wait_for_container_running(cname, proc)
+        assert proc.stdin is not None
+        proc.stdin.write(task_prompt(project, task)); proc.stdin.close()
+    except Exception:
+        stdout_file.close()
+        sh("docker", "rm", "-f", cname, check=False, timeout=20)
+        remove_volume(volume)
+        raise
     project.running.add(tid)
     return Job(project, task, account, slot, proc, lane_dir, worktree, base,
                volume, log_file, stdout_file)

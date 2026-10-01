@@ -167,6 +167,44 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(rc, 4)
         inner.assert_not_called()
 
+    def test_launch_job_holds_account_lock_until_container_running(self):
+        task = {"task_id": "t1", "goal": "x", "dependencies": [], "write_scope": ["src/t1"]}
+        project = mx.Project(name="p1", repo=Path(self.tmp.name), goal="", tasks={"t1": task})
+        run_root = Path(self.tmp.name) / "run"
+        run_root.mkdir()
+        worktree = Path(self.tmp.name) / "worktree"
+        worktree.mkdir()
+        (worktree / ".git").mkdir()
+        active = {"value": False}
+
+        class Guard:
+            def __enter__(self):
+                active["value"] = True
+            def __exit__(self, *_):
+                active["value"] = False
+
+        proc = mock.MagicMock()
+        proc.stdin = mock.MagicMock()
+
+        def assert_locked(*_args, **_kwargs):
+            self.assertTrue(active["value"])
+
+        with mock.patch.object(mx, "create_lane_worktree", return_value=(worktree, "base")), \
+             mock.patch.object(mx, "account_operation_lock", return_value=Guard()), \
+             mock.patch.object(mx, "clone_volume", side_effect=assert_locked), \
+             mock.patch.object(mx, "install_profile", side_effect=assert_locked), \
+             mock.patch.object(mx.subprocess, "Popen", side_effect=lambda *a, **k: (assert_locked(), proc)[1]), \
+             mock.patch.object(mx, "wait_for_container_running", side_effect=assert_locked), \
+             mock.patch.object(mx, "master_volume", return_value="master-A1"), \
+             mock.patch.object(mx, "lane_volume", return_value="lane-A1"):
+            job = mx.launch_job(project, task, "A1", 1, "image", run_root, "run1")
+
+        self.assertFalse(active["value"])
+        self.assertIs(job.proc, proc)
+        proc.stdin.write.assert_called_once()
+        job.stdout_file.close()
+
+
 
 if __name__ == "__main__":
     unittest.main()

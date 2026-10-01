@@ -151,9 +151,6 @@ class QuotaIsolationTests(unittest.TestCase):
         setter.assert_not_called()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class OrphanQuotaVolumeCleanupTests(unittest.TestCase):
     def test_cleanup_removes_only_unmounted_quota_volumes(self):
         listed = subprocess.CompletedProcess([], 0, stdout=(
@@ -176,3 +173,27 @@ class OrphanQuotaVolumeCleanupTests(unittest.TestCase):
         remove.assert_not_called()
         self.assertFalse(result["ok"])
 
+class CodexRegressionTests(unittest.TestCase):
+    def test_disabled_account_can_be_reenabled_from_ui(self):
+        db = {"accounts": {"A1": {"enabled": False}}}
+        with mock.patch.object(login_ui.core, "account_db", return_value=db), \
+             mock.patch.object(login_ui, "account_in_use", return_value=False), \
+             mock.patch.object(login_ui.core, "toggle_account_enabled", return_value=True) as toggle, \
+             mock.patch.object(login_ui, "patch_ui"):
+            ok, message = login_ui.toggle_account("A1")
+        self.assertTrue(ok)
+        self.assertEqual(message, "account_enabled")
+        toggle.assert_called_once_with("A1")
+
+    def test_legacy_binding_requires_reverify_before_quota_worker(self):
+        item = {"identity_sha256": "legacy", "enabled": True}
+        with mock.patch.object(login_ui.core, "require_registered_account", return_value=item), \
+             mock.patch.object(login_ui, "maybe_refresh_quota") as refresh:
+            ok, message = login_ui.start_quota_refresh("A1")
+        self.assertFalse(ok)
+        self.assertEqual(message, "quota_requires_reverify")
+        refresh.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -179,14 +179,16 @@ def quota_worker(account: str) -> None:
                 if not binding_hash or not binding_id:
                     raise RuntimeError("quota_requires_reverify")
                 core.clone_volume(IMAGE, core.master_volume(account), clone_volume)
+                # Keep the per-account lock through the provider read so login/bind/lane
+                # startup cannot overlap /usage for the same identity boundary.
+                groups = quota_usage.probe_account_usage(
+                    account=account, account_volume=clone_volume, image=IMAGE,
+                    timeout=QUOTA_TIMEOUT_SECONDS,
+                )
         except BlockingIOError:
             patch_ui(account, quota_refreshing=False, quota_status="busy",
                      quota_error="quota_busy", quota_next_retry_at=time.time() + QUOTA_RETRY_SECONDS)
             return
-        groups = quota_usage.probe_account_usage(
-            account=account, account_volume=clone_volume, image=IMAGE,
-            timeout=QUOTA_TIMEOUT_SECONDS,
-        )
         current = (core.account_db().get("accounts") or {}).get(account) or {}
         if (current.get("identity_sha256") != binding_hash or
                 int(current.get("credential_generation") or 0) != binding_generation):
@@ -203,7 +205,8 @@ def quota_worker(account: str) -> None:
                  quota_error="quota_timeout", quota_next_retry_at=time.time() + QUOTA_RETRY_SECONDS)
     except Exception as exc:
         text = str(exc)
-        known = {"quota_payload_unavailable", "quota_requires_verified_account"}
+        known = {"quota_payload_unavailable", "quota_requires_verified_account",
+                 "quota_requires_reverify"}
         reason = text if text in known or text.startswith("agy_usage_exit_") else "quota_unavailable"
         patch_ui(account, quota_refreshing=False, quota_status="unavailable",
                  quota_error=reason, quota_next_retry_at=time.time() + QUOTA_RETRY_SECONDS)
@@ -262,6 +265,8 @@ def start_quota_refresh(account: str) -> tuple[bool, str]:
         return False, str(exc)
     if not item.get("identity_sha256"):
         return False, "quota_requires_verified_account"
+    if not item.get("binding_id"):
+        return False, "quota_requires_reverify"
     if account_in_use(account):
         return False, "quota_busy"
     if not maybe_refresh_quota(account, force=True):
@@ -374,7 +379,9 @@ def add_account(account: str) -> tuple[bool, str]:
 
 def toggle_account(account: str) -> tuple[bool, str]:
     try:
-        core.require_registered_account(account)
+        account = core.validate_id(account, "account id")
+        if account not in (core.account_db().get("accounts") or {}):
+            raise ValueError(f"unknown account: {account}")
     except Exception as exc:
         return False, str(exc)
     if account_in_use(account):
@@ -490,9 +497,11 @@ def project_rows(lanes: list[dict] | None = None) -> list[dict]:
         item = db[name]
         enabled = item.get("enabled", True) is not False
         running = active_by_project.get(name, [])
-        tasks = item.get("task_count")
+        # Prefer the current plan on disk so the dashboard tracks edits made after
+        # registration. Persisted task_count is only a fallback for unavailable plans.
+        tasks = plan_task_count(item.get("plan"))
         if tasks is None:
-            tasks = plan_task_count(item.get("plan"))
+            tasks = item.get("task_count")
         rows.append({
             "name": name, "enabled": enabled, "repo": item.get("repo"),
             "plan": item.get("plan"), "goal": item.get("goal") or "",
