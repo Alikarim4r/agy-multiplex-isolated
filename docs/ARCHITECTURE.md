@@ -22,6 +22,8 @@ Accounts and projects are both dynamic lists. There is no fixed cardinality in t
 
 For `N` selected accounts and `S` slots per account, logical account-slot capacity is `N × S`. A global `max_workers` cap may reduce that number. Ready tasks are selected round-robin across projects while conflicting write scopes within one project are kept serial.
 
+Within each ready task, routing is quota-aware across both account and model. Ordered model candidates express quality preference. Fresh provider-family quota snapshots rank eligible account/model pairs; runtime 429/`RESOURCE_EXHAUSTED` results exclude only the failed pair and cause a bounded retry. If the preferred model is exhausted across the account pool, routing falls back to the next configured model.
+
 ## Fail-closed checks
 
 A lane is rejected when any of these conditions occur:

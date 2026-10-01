@@ -20,6 +20,12 @@ selected accounts × per_account_slots
 
 `max_workers` can cap that capacity globally.
 
+## Quota-aware account × model routing
+
+Account selection and model selection are one routing decision. Projects can define an ordered model priority list. Before a run, the scheduler probes the official `/usage` quota view for every selected account using disposable credential clones, prefers the highest-priority model with healthy quota, and chooses the account with the strongest known remaining headroom.
+
+If a lane reaches `429` / `RESOURCE_EXHAUSTED`, the task is retried from a fresh isolated lane on another account for the same model. If that model is exhausted across the pool, the scheduler moves to the next configured model. Model-unavailable errors also trigger fallback rather than silently changing quality. Retry limits remain bounded. See [docs/ROUTING.md](docs/ROUTING.md).
+
 ## 5-hour and weekly usage
 
 The local bilingual login UI can show **used percentage** for the rolling 5-hour and weekly quota windows. Antigravity exposes separate quota groups, commonly **Gemini Models** and **Claude / GPT models**, so both groups are shown when available.
@@ -100,7 +106,9 @@ agy-multiplex-isolated add-project \
   --name saferim \
   --repo ~/saferim \
   --plan ~/plans/saferim.json \
-  --goal "Implement the approved SafeRim scope"
+  --goal "Implement the approved SafeRim scope" \
+  --model claude-opus-4-6-thinking \
+  --fallback-model gemini-3.8-flash-high
 
 agy-multiplex-isolated projects
 ```

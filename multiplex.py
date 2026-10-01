@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import routing as rt
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - public alpha currently targets macOS/Linux
@@ -314,6 +316,7 @@ class Project:
     goal: str
     tasks: dict[str, dict[str, Any]]
     model: str | None = None
+    models: list[str] = field(default_factory=list)
     staging: Path | None = None
     branch: str | None = None
     base_sha: str | None = None
@@ -338,6 +341,8 @@ class Job:
     task: dict[str, Any]
     account: str
     slot: int
+    model: str | None
+    attempt: int
     proc: subprocess.Popen[str]
     lane_dir: Path
     worktree: Path
@@ -394,8 +399,13 @@ def project_from_record(raw: dict[str, Any]) -> Project:
     plan = Path(str(plan_value)).expanduser().resolve()
     if not plan.is_file():
         raise ValueError(f"project plan does not exist: {plan}")
+    models = rt.normalize_models(raw.get("models"))
+    legacy_model = str(raw.get("model") or "").strip() or None
+    if legacy_model and legacy_model.casefold() not in {m.casefold() for m in models}:
+        models.insert(0, legacy_model)
+    primary_model = models[0] if models else legacy_model
     return Project(name=name, repo=repo, goal=str(raw.get("goal") or ""),
-                   tasks=load_plan(plan), model=(str(raw.get("model")) if raw.get("model") else None))
+                   tasks=load_plan(plan), model=primary_model, models=models)
 
 
 def load_manifest(path: Path | None) -> tuple[dict[str, Any], list[Project]]:
@@ -465,9 +475,11 @@ def task_prompt(project: Project, task: dict[str, Any]) -> str:
     return f"""You are one isolated implementation lane.\nProject goal: {project.goal}\nTask: {task.get('goal','')}\nYou may modify ONLY: {scopes}\nDo not commit, push, merge, deploy, or change Git state.\nDo not touch files outside the allowed write scope.\nAcceptance:\n{acceptance}\nImplement the task completely, then report a concise summary."""
 
 def launch_job(project: Project, task: dict[str, Any], account: str, slot: int,
-               image: str, run_root: Path, run_id: str) -> Job:
+               image: str, run_root: Path, run_id: str, *,
+               model: str | None = None, attempt: int = 1) -> Job:
     tid = str(task["task_id"])
-    lane_dir = run_root / "projects" / slug(project.name) / "lanes" / slug(tid)
+    lane_name = slug(tid) if attempt == 1 else f"{slug(tid)}-retry-{attempt}"
+    lane_dir = run_root / "projects" / slug(project.name) / "lanes" / lane_name
     lane_dir.mkdir(parents=True, exist_ok=False)
     worktree, base = create_lane_worktree(project, tid, lane_dir)
     volume = lane_volume(run_id, account, project.name, tid, slot)
@@ -495,8 +507,8 @@ def launch_job(project: Project, task: dict[str, Any], account: str, slot: int,
            "--project", project_id, "--mode=accept-edits", "--sandbox",
            "--output-format", "json", "--print-timeout", "900s",
            "--log-file", "/evidence/agy.log"]
-    if project.model:
-        cmd += ["--model", project.model]
+    if model:
+        cmd += ["--model", model]
     proc = None
     try:
         # The lock spans clone + container startup. Once Docker reports Running,
@@ -516,7 +528,7 @@ def launch_job(project: Project, task: dict[str, Any], account: str, slot: int,
         remove_volume(volume)
         raise
     project.running.add(tid)
-    return Job(project, task, account, slot, proc, lane_dir, worktree, base,
+    return Job(project, task, account, slot, model, attempt, proc, lane_dir, worktree, base,
                volume, log_file, stdout_file)
 
 
@@ -529,7 +541,9 @@ def finish_job(job: Job, accounts: dict[str, Any]) -> tuple[bool, str, dict[str,
     tid = str(job.task["task_id"])
     job.project.running.discard(tid)
     meta: dict[str, Any] = {"task_id": tid, "account": job.account, "slot": job.slot,
-                            "exit_code": job.proc.returncode, "worktree": str(job.worktree)}
+                            "model": job.model, "model_family": rt.model_family(job.model),
+                            "attempt": job.attempt, "exit_code": job.proc.returncode,
+                            "worktree": str(job.worktree)}
     ids = log_identities(job.log_file)
     meta["identity_events"] = len(ids)
     expected = ((accounts.get("accounts") or {}).get(job.account) or {}).get("identity_sha256")
@@ -810,11 +824,15 @@ def _cmd_bind_locked(args: argparse.Namespace) -> int:
 
 
 def add_project(name: str, repo: str | Path, plan: str | Path, *, goal: str = "",
-                model: str | None = None) -> Project:
+                model: str | None = None, models: list[str] | None = None) -> Project:
     name = validate_id(name, "project id")
     repo_path = Path(repo).expanduser().resolve(); plan_path = Path(plan).expanduser().resolve()
+    ordered_models = rt.normalize_models(models or [])
+    if model and model.casefold() not in {m.casefold() for m in ordered_models}:
+        ordered_models.insert(0, model)
+    primary = ordered_models[0] if ordered_models else (model or None)
     record = {"name": name, "repo": str(repo_path), "plan": str(plan_path), "goal": goal or "",
-              "model": model or None, "enabled": True,
+              "model": primary, "models": ordered_models, "enabled": True,
               "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     project = project_from_record(record); validate_dag(project)
     record["task_count"] = len(project.tasks)
@@ -829,7 +847,10 @@ def add_project(name: str, repo: str | Path, plan: str | Path, *, goal: str = ""
 
 
 def cmd_project_add(args: argparse.Namespace) -> int:
-    project = add_project(args.name, args.repo, args.plan, goal=args.goal or "", model=args.model)
+    fallbacks = list(args.fallback_model or [])
+    models = ([args.model] if args.model else []) + fallbacks
+    project = add_project(args.name, args.repo, args.plan, goal=args.goal or "",
+                          model=args.model, models=models)
     print(json.dumps({"status": "project_added", "project": project.name,
                       "tasks": len(project.tasks), "repo": str(project.repo)}, indent=2)); return 0
 
@@ -838,7 +859,8 @@ def cmd_projects(_: argparse.Namespace) -> int:
     rows = []
     for raw in registered_project_records(enabled_only=False):
         rows.append({"name": raw["name"], "enabled": raw.get("enabled", True) is not False,
-                     "repo": raw.get("repo"), "plan": raw.get("plan"), "model": raw.get("model")})
+                     "repo": raw.get("repo"), "plan": raw.get("plan"),
+                     "model": raw.get("model"), "models": raw.get("models") or []})
     print(json.dumps({"projects": rows, "count": len(rows)}, indent=2, ensure_ascii=False)); return 0
 
 
@@ -907,6 +929,70 @@ def effective_capacity(data: dict[str, Any], accounts: list[str], slots: int, ov
     return min(requested, len(accounts) * slots)
 
 
+def routing_policy(data: dict[str, Any]) -> dict[str, Any]:
+    raw = data.get("routing") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("manifest.routing must be an object")
+    min_remaining = float(raw.get("min_remaining_percent", 1.0))
+    if not 0.0 <= min_remaining < 100.0:
+        raise ValueError("routing.min_remaining_percent must be between 0 and 100")
+    max_attempts = int(raw.get("max_route_attempts", 12))
+    if max_attempts < 1:
+        raise ValueError("routing.max_route_attempts must be >= 1")
+    return {
+        "quota_aware": raw.get("quota_aware", True) is not False,
+        "min_remaining_percent": min_remaining,
+        "max_route_attempts": max_attempts,
+        "quota_timeout_seconds": max(8, int(raw.get("quota_timeout_seconds", 25))),
+        "quota_probe_workers": max(1, int(raw.get("quota_probe_workers", 2))),
+    }
+
+
+def project_task_models(project: Project, task: dict[str, Any]) -> list[str | None]:
+    return rt.task_models(project.models or ([project.model] if project.model else []), task)
+
+
+def probe_quota_matrix(accounts: list[str], image: str, *, timeout: int = 25, workers: int = 2) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
+    from concurrent.futures import ThreadPoolExecutor
+    from ui import quota_usage
+
+    def probe(account: str) -> tuple[str, list[dict[str, Any]], str | None]:
+        clone = f"agy-route-probe-{slug(account)}-{uuid.uuid4().hex[:8]}"
+        try:
+            with account_operation_lock(account):
+                clone_volume(image, master_volume(account), clone)
+            groups = quota_usage.probe_account_usage(
+                account=account, account_volume=clone, image=image, timeout=timeout
+            )
+            return account, groups, None
+        except Exception as exc:
+            return account, [], f"{type(exc).__name__}:{exc}"
+        finally:
+            remove_volume(clone)
+
+    matrix: dict[str, list[dict[str, Any]]] = {}
+    errors: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(accounts)))) as executor:
+        for account, groups, error in executor.map(probe, accounts):
+            if groups:
+                matrix[account] = groups
+            if error:
+                errors[account] = error
+    return matrix, errors
+
+
+def quota_summary(matrix: dict[str, list[dict[str, Any]]]) -> dict[str, dict[str, float]]:
+    out: dict[str, dict[str, float]] = {}
+    for account, groups in matrix.items():
+        row: dict[str, float] = {}
+        for family in ("gemini", "claude_gpt"):
+            remaining = rt.quota_remaining(groups, "gemini" if family == "gemini" else "claude")
+            if remaining is not None:
+                row[family] = remaining
+        out[account] = row
+    return out
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     manifest_path = manifest_path_arg(args.manifest)
     data, projects = load_manifest(manifest_path)
@@ -931,8 +1017,10 @@ def projected_wave(projects: list[Project], accounts: list[str], slots: int, cap
             if not ready: continue
             task = ready[0]; used[p.name].append(task); p.running.add(str(task["task_id"]))
             account, slot = pool.pop(0)
+            models = project_task_models(p, task)
             wave.append({"project": p.name, "task_id": task["task_id"], "account": account,
-                         "account_slot": slot, "write_scope": task.get("write_scope")})
+                         "account_slot": slot, "model": models[0],
+                         "write_scope": task.get("write_scope")})
             progressed = True
             if not pool or len(wave) >= capacity: break
         if not progressed: break
@@ -967,6 +1055,52 @@ def select_task(projects: list[Project], cursor: int) -> tuple[Project, dict[str
             if not running_conflict(p, task):
                 return p, task, (cursor + step + 1) % len(projects)
     return None
+
+
+def select_routable_task(
+    projects: list[Project],
+    cursor: int,
+    *,
+    accounts: list[str],
+    slots: int,
+    active: list[Job],
+    quota_matrix: dict[str, list[dict[str, Any]]],
+    route_exclusions: dict[tuple[str, str], set[tuple[str, str]]],
+    blocked_models: dict[str, set[str]],
+    min_remaining_percent: float,
+    route_cursor: int,
+) -> tuple[Project, dict[str, Any], rt.RouteChoice, int] | None:
+    active_pairs = {(job.account, job.slot) for job in active}
+    for step in range(len(projects)):
+        project = projects[(cursor + step) % len(projects)]
+        for task in project.ready():
+            if running_conflict(project, task):
+                continue
+            tid = str(task["task_id"])
+            route = rt.choose_route(
+                accounts=accounts,
+                slots=slots,
+                active_pairs=active_pairs,
+                models=project_task_models(project, task),
+                quota_matrix=quota_matrix,
+                exclusions=route_exclusions.get((project.name, tid), set()),
+                blocked_models=blocked_models.get(project.name, set()),
+                min_remaining_percent=min_remaining_percent,
+                cursor=route_cursor,
+            )
+            if route is not None:
+                return project, task, route, (cursor + step + 1) % len(projects)
+    return None
+
+
+def job_route_failure_kind(job: Job) -> str | None:
+    text_parts: list[str] = []
+    for path in (job.lane_dir / "stdout.log", job.log_file):
+        try:
+            text_parts.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            pass
+    return rt.route_failure_kind("\n".join(text_parts))
 
 
 def event(run_root: Path, kind: str, **payload: Any) -> None:
@@ -1018,6 +1152,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     data, projects = load_manifest(manifest_path)
     accounts = resolve_accounts(data); slots = resolve_slots(data)
     capacity = effective_capacity(data, accounts, slots, args.max_workers)
+    policy = routing_policy(data)
     image = str(data.get("image") or args.image)
     expected_version = str(data.get("agy_version") or args.agy_version)
     actual_version = image_version(image)
@@ -1030,52 +1165,119 @@ def cmd_run(args: argparse.Namespace) -> int:
     if unknown or disabled or unbound:
         print(json.dumps({"status": "blocked", "reason": "account pool is not ready",
                           "unknown": unknown, "disabled": disabled, "unbound": unbound}, indent=2)); return 2
+
     run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
     run_root = RUNS / run_id; run_root.mkdir(parents=True, exist_ok=False)
     if manifest_path is not None:
         shutil.copy2(manifest_path, run_root / "manifest.input.json")
+
+    quota_matrix: dict[str, list[dict[str, Any]]] = {}
+    quota_errors: dict[str, str] = {}
+    if policy["quota_aware"]:
+        quota_matrix, quota_errors = probe_quota_matrix(
+            accounts, image,
+            timeout=policy["quota_timeout_seconds"],
+            workers=policy["quota_probe_workers"],
+        )
+    write_json(run_root / "routing.quota.json", {
+        "quota_aware": policy["quota_aware"],
+        "min_remaining_percent": policy["min_remaining_percent"],
+        "remaining_by_family": quota_summary(quota_matrix),
+        "probe_errors": quota_errors,
+    })
     write_json(run_root / "manifest.effective.json", {
         "accounts": accounts, "per_account_slots": slots, "max_workers": capacity,
-        "image": image, "agy_version": expected_version,
+        "image": image, "agy_version": expected_version, "routing": policy,
         "projects": [{"name": p.name, "repo": str(p.repo), "goal": p.goal,
-                      "model": p.model, "task_count": len(p.tasks)} for p in projects]})
-    for project in projects: setup_project(project, run_root, run_id)
+                      "model": p.model, "models": p.models, "task_count": len(p.tasks)} for p in projects]})
+    for project in projects:
+        setup_project(project, run_root, run_id)
     event(run_root, "RUN_STARTED", capacity=capacity, accounts=accounts, slots=slots,
-          project_count=len(projects), lab=bool(args.lab))
-    active: list[Job] = []; project_cursor = 0; slot_cursor = 0
+          project_count=len(projects), lab=bool(args.lab), routing=policy,
+          quota_summary=quota_summary(quota_matrix))
+
+    active: list[Job] = []
+    project_cursor = 0
+    route_cursor = 0
+    route_exclusions: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    blocked_models: dict[str, set[str]] = {}
+    attempts: dict[tuple[str, str], int] = {}
     try:
         while True:
             while len(active) < capacity:
-                picked = select_task(projects, project_cursor)
-                slot_pick = free_slot(accounts, slots, active, slot_cursor)
-                if picked is None or slot_pick is None: break
-                project, task, project_cursor = picked
-                account, slot, slot_cursor = slot_pick
-                job = launch_job(project, task, account, slot, image, run_root, run_id)
+                selected = select_routable_task(
+                    projects, project_cursor, accounts=accounts, slots=slots, active=active,
+                    quota_matrix=quota_matrix, route_exclusions=route_exclusions,
+                    blocked_models=blocked_models,
+                    min_remaining_percent=policy["min_remaining_percent"],
+                    route_cursor=route_cursor,
+                )
+                if selected is None:
+                    break
+                project, task, route, project_cursor = selected
+                route_cursor = route.cursor
+                tid = str(task["task_id"]); key = (project.name, tid)
+                attempts[key] = attempts.get(key, 0) + 1
+                job = launch_job(
+                    project, task, route.account, route.slot, image, run_root, run_id,
+                    model=route.model, attempt=attempts[key],
+                )
                 active.append(job)
-                event(run_root, "LANE_STARTED", project=project.name, task_id=task["task_id"],
-                      account=account, slot=slot, pid=job.proc.pid)
-            if not active: break
+                event(run_root, "LANE_STARTED", project=project.name, task_id=tid,
+                      account=route.account, slot=route.slot, model=route.model,
+                      model_family=route.family, quota_remaining_percent=route.remaining_percent,
+                      attempt=attempts[key], pid=job.proc.pid)
+
+            if not active:
+                ready = [(p, t) for p in projects for t in p.ready() if not running_conflict(p, t)]
+                if ready:
+                    project, task = ready[0]
+                    tid = str(task["task_id"]); key = (project.name, tid)
+                    project.failed.add(tid)
+                    event(run_root, "LANE_FAILED", project=project.name, task_id=tid,
+                          message="no eligible account/model route",
+                          attempts=attempts.get(key, 0),
+                          models=project_task_models(project, task))
+                    continue
+                break
+
             time.sleep(0.75)
             for job in list(active):
-                if job.proc.poll() is None: continue
+                if job.proc.poll() is None:
+                    continue
+                failure_kind = job_route_failure_kind(job) if job.proc.returncode else None
                 ok, message, meta = finish_job(job, db)
                 remove_volume(job.home_volume)
-                tid = str(job.task["task_id"])
+                tid = str(job.task["task_id"]); key = (job.project.name, tid)
                 if ok:
-                    job.project.completed.add(tid); event(run_root, "LANE_COMPLETED", project=job.project.name, message=message, **meta)
+                    job.project.completed.add(tid)
+                    event(run_root, "LANE_COMPLETED", project=job.project.name, message=message, **meta)
+                elif failure_kind and attempts.get(key, 0) < policy["max_route_attempts"]:
+                    model_key = (job.model or "").casefold()
+                    route_exclusions.setdefault(key, set()).add((job.account, model_key))
+                    if failure_kind == "model_unavailable" and model_key:
+                        blocked_models.setdefault(job.project.name, set()).add(model_key)
+                    event(run_root, "LANE_ROUTE_RETRY", project=job.project.name,
+                          message=message, failure_kind=failure_kind, **meta)
                 else:
-                    job.project.failed.add(tid); event(run_root, "LANE_FAILED", project=job.project.name, message=message, **meta)
-                write_json(job.lane_dir / "result.json", {"ok": ok, "message": message, **meta})
+                    job.project.failed.add(tid)
+                    if failure_kind:
+                        meta["failure_kind"] = failure_kind
+                    event(run_root, "LANE_FAILED", project=job.project.name, message=message, **meta)
+                write_json(job.lane_dir / "result.json", {
+                    "ok": ok, "message": message, "route_failure_kind": failure_kind, **meta
+                })
                 active.remove(job)
     except KeyboardInterrupt:
         event(run_root, "RUN_INTERRUPTED"); kill_run_containers(run_id); remove_run_volumes(run_id); raise
     except Exception:
         event(run_root, "RUN_ABORTED"); kill_run_containers(run_id); remove_run_volumes(run_id); raise
+
     summaries = [project_summary(p) for p in projects]
     success = all(not x["failed"] and not x["pending"] for x in summaries)
     result = {"status": "success" if success else "partial_failure", "run_id": run_id,
               "capacity": capacity, "accounts": accounts, "per_account_slots": slots,
+              "routing": {"policy": policy, "attempts": {f"{p}/{t}": n for (p, t), n in attempts.items()}},
               "projects": summaries, "review_required": True,
               "pushed": False, "merged_to_main": False, "deployed": False}
     write_json(run_root / "result.json", result); event(run_root, "RUN_FINISHED", status=result["status"])
@@ -1120,7 +1322,10 @@ def parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("projects", help="List registered projects"); ps.set_defaults(func=cmd_projects)
     pa = sub.add_parser("add-project", help="Register or update a project")
     pa.add_argument("--name", required=True); pa.add_argument("--repo", required=True); pa.add_argument("--plan", required=True)
-    pa.add_argument("--goal", default=""); pa.add_argument("--model"); pa.set_defaults(func=cmd_project_add)
+    pa.add_argument("--goal", default=""); pa.add_argument("--model")
+    pa.add_argument("--fallback-model", action="append", default=[],
+                    help="Fallback model ID; repeat to define priority order")
+    pa.set_defaults(func=cmd_project_add)
     pe = sub.add_parser("enable-project"); pe.add_argument("name"); pe.set_defaults(func=cmd_project_enable)
     pd = sub.add_parser("disable-project"); pd.add_argument("name"); pd.set_defaults(func=cmd_project_disable)
     pr = sub.add_parser("remove-project", help="Remove registration without deleting repository")

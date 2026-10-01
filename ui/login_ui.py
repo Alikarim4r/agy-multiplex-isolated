@@ -505,7 +505,8 @@ def project_rows(lanes: list[dict] | None = None) -> list[dict]:
         rows.append({
             "name": name, "enabled": enabled, "repo": item.get("repo"),
             "plan": item.get("plan"), "goal": item.get("goal") or "",
-            "model": item.get("model"), "created_at": item.get("created_at"),
+            "model": item.get("model"), "models": item.get("models") or [],
+            "created_at": item.get("created_at"),
             "task_count": tasks, "active_lanes": len(running),
             "accounts": sorted({str(x.get("account")) for x in running if x.get("account")}, key=str.casefold),
             "status": "running" if running else ("ready" if enabled else "disabled"),
@@ -597,8 +598,10 @@ def add_project_from_ui(data: dict) -> tuple[bool, str]:
         repo = str(data.get("repo") or "").strip()
         plan = str(data.get("plan") or "").strip()
         goal = str(data.get("goal") or "").strip()
-        model = str(data.get("model") or "").strip() or None
-        project = core.add_project(name, repo, plan, goal=goal, model=model)
+        model_text = str(data.get("model") or "").strip()
+        models = core.rt.normalize_models(model_text)
+        model = models[0] if models else None
+        project = core.add_project(name, repo, plan, goal=goal, model=model, models=models)
         return True, f"project_added:{project.name}"
     except Exception as exc:
         return False, str(exc)

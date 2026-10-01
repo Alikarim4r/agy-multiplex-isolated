@@ -11,7 +11,7 @@ install:
 	./install.sh
 
 check:
-	python3 -m compileall -q multiplex.py ui tests tools
+	python3 -m compileall -q multiplex.py routing.py ui tests tools
 	python3 tools/check_release.py
 
 test:

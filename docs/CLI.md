@@ -21,7 +21,7 @@ Account IDs use letters, numbers, `_`, and `-`, are unique case-insensitively, a
 ## Projects
 
 - `projects`
-- `add-project --name ID --repo PATH --plan PATH [--goal TEXT] [--model MODEL]`
+- `add-project --name ID --repo PATH --plan PATH [--goal TEXT] [--model MODEL] [--fallback-model MODEL ...]`
 - `enable-project ID`
 - `disable-project ID`
 - `remove-project ID` — unregisters only; the repository is never deleted.
@@ -35,6 +35,8 @@ Account IDs use letters, numbers, `_`, and `-`, are unique case-insensitively, a
 - `cleanup RUN_ID`
 
 If no manifest is supplied, all enabled account and project registry entries are used. A manifest can specify `accounts: "all"`, `projects: "all"`, explicit lists, `per_account_slots`, and `max_workers`.
+
+Projects may store an ordered `models` list. Tasks may override it with task-level `model` or `models`. The optional manifest `routing` object controls quota-aware preflight, the minimum remaining percentage, probe concurrency/timeouts, and bounded account/model failover attempts.
 
 ## Live gate
 
