@@ -224,7 +224,7 @@ def remove_volume(name: str) -> None:
 
 
 def project_profile(project_id: str) -> dict[str, Any]:
-    allow = ["read_file(/workspace/)", "write_file(/workspace/)"]
+    allow = ["read_file(/workspace/)", "write_file(/workspace/)", "command(*)"]
     deny = [f"command({name})" for name in DENY_CMDS]
     return {
         "id": project_id,
