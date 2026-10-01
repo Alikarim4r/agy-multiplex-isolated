@@ -223,8 +223,25 @@ def remove_volume(name: str) -> None:
     sh("docker", "volume", "rm", "-f", name, check=False, timeout=20)
 
 
-def project_profile(project_id: str) -> dict[str, Any]:
+def configured_reference_roots() -> list[Path]:
+    raw = os.environ.get("AGY_MULTIPLEX_REFERENCE_ROOTS", "").strip()
+    if not raw:
+        return []
+    roots: list[Path] = []
+    for item in raw.split(os.pathsep):
+        if not item.strip():
+            continue
+        path = Path(item).expanduser().resolve()
+        if not path.is_dir():
+            raise ValueError(f"read-only reference root does not exist: {path}")
+        roots.append(path)
+    return roots
+
+
+def project_profile(project_id: str, read_only_roots: list[Path] | None = None) -> dict[str, Any]:
     allow = ["read_file(/workspace/)", "write_file(/workspace/)", "command(*)"]
+    for root in read_only_roots or []:
+        allow.append(f"read_file({str(root).rstrip('/')}/)")
     deny = [f"command({name})" for name in DENY_CMDS]
     return {
         "id": project_id,
@@ -456,7 +473,8 @@ def launch_job(project: Project, task: dict[str, Any], account: str, slot: int,
     volume = lane_volume(run_id, account, project.name, tid, slot)
     project_id = f"agyiso-{slug(project.name)}-{slug(tid)}-{uuid.uuid4().hex[:6]}"
     profile_file = lane_dir / "project.json"
-    write_json(profile_file, project_profile(project_id))
+    reference_roots = configured_reference_roots()
+    write_json(profile_file, project_profile(project_id, reference_roots))
     evidence = lane_dir / "evidence"; evidence.mkdir(exist_ok=True)
     log_file = evidence / "agy.log"
     stdout_file = (lane_dir / "stdout.log").open("w", encoding="utf-8")
@@ -470,8 +488,10 @@ def launch_job(project: Project, task: dict[str, Any], account: str, slot: int,
            "-v", f"{volume}:/home/agy",
            "-v", f"{worktree}:/workspace",
            "-v", f"{worktree / '.git'}:/workspace/.git:ro",
-           "-v", f"{evidence}:/evidence",
-           "-w", "/workspace", image, "agy",
+           "-v", f"{evidence}:/evidence"]
+    for root in reference_roots:
+        cmd += ["-v", f"{root}:{root}:ro"]
+    cmd += ["-w", "/workspace", image, "agy",
            "--project", project_id, "--mode=accept-edits", "--sandbox",
            "--output-format", "json", "--print-timeout", "900s",
            "--log-file", "/evidence/agy.log"]
