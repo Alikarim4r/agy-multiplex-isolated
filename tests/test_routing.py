@@ -89,3 +89,8 @@ class RoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_route_failure_kind_detects_invalid_model_selection():
+    text = 'invalid model selection: model foo is not recognized as a known model'
+    assert rt.route_failure_kind(text) == "model_unavailable"

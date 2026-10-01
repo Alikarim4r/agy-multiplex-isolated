@@ -144,6 +144,8 @@ def route_failure_kind(text: str) -> str | None:
         "model is unavailable",
         "unsupported model",
         "unknown model",
+        "invalid model selection",
+        "not recognized as a known model",
     )
     if any(marker in low for marker in model_markers):
         return "model_unavailable"
