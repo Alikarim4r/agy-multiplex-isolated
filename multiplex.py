@@ -565,6 +565,8 @@ def finish_job(job: Job, accounts: dict[str, Any]) -> tuple[bool, str, dict[str,
         return False, "changes outside write_scope; lane rejected", meta
     if not paths:
         remove_volume(job.home_volume)
+        if bool(job.task.get("require_changes", False)):
+            return False, "task required file changes but produced none", meta
         return True, "success with no file changes", meta
     git("add", "-A", cwd=job.worktree)
     commit = git("-c", "user.name=AGY-MULTIPLEX-ISOLATED",
